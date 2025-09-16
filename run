@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""
+DynamoDB Mirror CLI tool.
+
+Provides command-line interface for mirroring DynamoDB tables to SQLite
+with support for table name mapping and configuration management.
+"""
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+from typing import List
+
+import colorama
+from colorama import Fore, Style
+
+# Add src directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+from dynamo_mirror import mirror_dynamodb_tables, TableMapping  # noqa: E402
+
+
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging with colored output for better readability."""
+    colorama.init(autoreset=True)
+
+    level = logging.DEBUG if verbose else logging.INFO
+
+    # Custom formatter with colors
+    class ColoredFormatter(logging.Formatter):
+        COLORS = {
+            'DEBUG': Fore.CYAN,
+            'INFO': Fore.GREEN,
+            'WARNING': Fore.YELLOW,
+            'ERROR': Fore.RED,
+            'CRITICAL': Fore.MAGENTA + Style.BRIGHT,
+        }
+
+        def format(self, record):
+            color = self.COLORS.get(record.levelname, '')
+            record.levelname = f"{color}{record.levelname}{Style.RESET_ALL}"
+            return super().format(record)
+
+    formatter = ColoredFormatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+
+    logger = logging.getLogger()
+    logger.setLevel(level)
+    logger.addHandler(handler)
+
+
+def read_stage_prefix() -> str:
+    """Read stage prefix from bosphorus middleware configuration."""
+    stage_file = Path.home() / "work" / "bosphorus-middleware" / ".sst" / "stage"
+
+    try:
+        with open(stage_file) as f:
+            stage = f.read().strip()
+
+        if not stage:
+            raise ValueError("Stage file is empty")
+
+        logging.info(f"Using stage prefix: {stage}")
+        return stage
+
+    except FileNotFoundError:
+        logging.error(f"Stage file not found: {stage_file}")
+        logging.error("Please ensure bosphorus-middleware is properly set up")
+        sys.exit(1)
+
+    except Exception as e:
+        logging.error(f"Failed to read stage file: {e}")
+        sys.exit(1)
+
+
+def create_default_table_mappings(stage_prefix: str) -> List[TableMapping]:
+    """Create default table mappings for bosphorus tables."""
+    base_tables = [
+        ("LendingTable", "lending"),
+        ("onboarding", "onboarding"),
+        ("OnboardingDocument", "onboarding_document"),
+        ("OnboardingReferenceData", "onboarding_reference_data"),
+    ]
+
+    mappings = []
+    for dynamodb_suffix, sqlite_name in base_tables:
+        dynamodb_name = f"{stage_prefix}-bosphorus-{dynamodb_suffix}"
+        mappings.append(TableMapping(dynamodb_name, sqlite_name))
+
+    return mappings
+
+
+def validate_aws_credentials() -> None:
+    """Verify AWS credentials are available."""
+    try:
+        import boto3
+        # Try to create a client to test credentials
+        boto3.client('sts').get_caller_identity()
+        logging.info("AWS credentials validated successfully")
+    except Exception as e:
+        logging.error(f"AWS credentials failed: {e}")
+        if "Token has expired" in str(e) or "InvalidGrantException" in str(e):
+            logging.error("Your AWS SSO session has expired. Please refresh your credentials:")
+            logging.error("  aws sso login")
+        else:
+            logging.error("Please configure AWS credentials using:")
+            logging.error("  - AWS CLI: aws configure")
+            logging.error("  - Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY")
+            logging.error("  - IAM roles (if running on EC2)")
+        sys.exit(1)
+
+
+def main() -> None:
+    """Main CLI entry point with argument parsing and command routing."""
+    parser = argparse.ArgumentParser(
+        description="Mirror DynamoDB tables to SQLite database",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                          # Mirror default bosphorus tables
+  %(prog)s --db-path ./data/mirror.db
+  %(prog)s --region us-west-2 --verbose
+  %(prog)s --poll-interval 30       # More responsive (check every 30 seconds)
+  %(prog)s --poll-interval 5        # High responsiveness (check every 5 seconds)
+  %(prog)s --tables table1 table2 --no-mapping
+
+Table Mappings:
+  Default mappings use stage prefix from ~/work/bosphorus-middleware/.sst/stage:
+    {stage}-bosphorus-LendingTable           -> lending
+    {stage}-bosphorus-onboarding             -> onboarding
+    {stage}-bosphorus-OnboardingDocument     -> onboarding_document
+    {stage}-bosphorus-OnboardingReferenceData -> onboarding_reference_data
+        """
+    )
+
+    parser.add_argument(
+        "--db-path",
+        default="./output/dynamo_mirror.db",
+        help="SQLite database file path (default: ./output/dynamo_mirror.db)"
+    )
+
+    parser.add_argument(
+        "--region",
+        help="AWS region (default: uses AWS CLI configured region)"
+    )
+
+    parser.add_argument(
+        "--tables",
+        nargs="+",
+        help="Specific DynamoDB table names to mirror (overrides defaults)"
+    )
+
+    parser.add_argument(
+        "--no-mapping",
+        action="store_true",
+        help="Use original DynamoDB table names in SQLite (no mapping)"
+    )
+
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose debug logging"
+    )
+
+    parser.add_argument(
+        "--poll-interval",
+        type=int,
+        default=60,
+        help="Stream polling interval in seconds (default: 60, higher = less resource usage)"
+    )
+
+    parser.add_argument(
+        "--shard-check-interval",
+        type=int,
+        default=600,
+        help="Interval to check for new shards in seconds (default: 600)"
+    )
+
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["mirror", "test", "validate"],
+        default="mirror",
+        help="Command to run (default: mirror)"
+    )
+
+    args = parser.parse_args()
+
+    # Setup logging first
+    setup_logging(args.verbose)
+
+    if args.command == "test":
+        run_tests()
+        return
+
+    if args.command == "validate":
+        validate_configuration()
+        return
+
+    # Mirror command (default)
+    logging.info(f"{Fore.BLUE}{Style.BRIGHT}Starting DynamoDB Mirror Service{Style.RESET_ALL}")
+
+    # Validate AWS credentials
+    validate_aws_credentials()
+
+    # Determine AWS region
+    region = args.region
+    if not region:
+        try:
+            import boto3
+            session = boto3.Session()
+            region = session.region_name or "us-east-1"
+        except Exception:
+            region = "us-east-1"
+
+    logging.info(f"Using AWS region: {region}")
+
+    # Determine table mappings
+    if args.tables:
+        # Use specific tables provided by user
+        if args.no_mapping:
+            # Use original names
+            table_mappings = [TableMapping(table, table) for table in args.tables]
+        else:
+            # Apply default mapping logic (remove stage prefix if present)
+            stage_prefix = read_stage_prefix()
+            table_mappings = []
+
+            for table in args.tables:
+                if table.startswith(f"{stage_prefix}-bosphorus-"):
+                    # Remove prefix and convert to snake_case
+                    clean_name = table[len(f"{stage_prefix}-bosphorus-"):]
+                    sqlite_name = clean_name.replace("Table", "").lower()
+                    if clean_name.startswith("Onboarding") and clean_name != "onboarding":
+                        sqlite_name = "onboarding_" + clean_name[10:].lower()
+                else:
+                    sqlite_name = table.lower()
+
+                table_mappings.append(TableMapping(table, sqlite_name))
+    else:
+        # Use default bosphorus tables
+        stage_prefix = read_stage_prefix()
+        table_mappings = create_default_table_mappings(stage_prefix)
+
+    # Display table mappings
+    logging.info("Table mappings:")
+    for mapping in table_mappings:
+        logging.info(f"  {mapping.dynamodb_name} -> {mapping.sqlite_name}")
+
+    # Ensure output directory exists
+    db_path = Path(args.db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Start mirroring service
+        mirror_dynamodb_tables(table_mappings, region, str(db_path),
+                               poll_interval=args.poll_interval,
+                               shard_check_interval=args.shard_check_interval)
+
+    except KeyboardInterrupt:
+        logging.info(f"{Fore.YELLOW}Service stopped by user{Style.RESET_ALL}")
+
+    except Exception as e:
+        logging.error(f"{Fore.RED}Service failed: {e}{Style.RESET_ALL}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+def run_tests() -> None:
+    """Run test suite."""
+    import unittest
+
+    logging.info(f"{Fore.BLUE}Running test suite{Style.RESET_ALL}")
+
+    # Discover and run tests
+    loader = unittest.TestLoader()
+    start_dir = Path(__file__).parent / "src"
+    suite = loader.discover(start_dir, pattern="*_test.py")
+
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+
+    if result.wasSuccessful():
+        logging.info(f"{Fore.GREEN}All tests passed!{Style.RESET_ALL}")
+    else:
+        logging.error(f"{Fore.RED}Some tests failed{Style.RESET_ALL}")
+        sys.exit(1)
+
+
+def validate_configuration() -> None:
+    """Validate configuration and dependencies."""
+    logging.info(f"{Fore.BLUE}Validating configuration{Style.RESET_ALL}")
+
+    issues = []
+
+    # Check AWS credentials
+    try:
+        validate_aws_credentials()
+        logging.info(f"{Fore.GREEN}✓ AWS credentials valid{Style.RESET_ALL}")
+    except SystemExit:
+        issues.append("AWS credentials failed - please refresh or reconfigure")
+
+    # Check stage file
+    try:
+        stage = read_stage_prefix()
+        logging.info(f"{Fore.GREEN}✓ Stage prefix: {stage}{Style.RESET_ALL}")
+    except SystemExit:
+        issues.append("Stage file not found or invalid")
+
+    # Check dependencies
+    try:
+        __import__('boto3')
+        __import__('colorama')
+        logging.info(f"{Fore.GREEN}✓ Required dependencies available{Style.RESET_ALL}")
+    except ImportError as e:
+        issues.append(f"Missing dependency: {e}")
+
+    # Check output directory permissions
+    output_dir = Path("./output")
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        test_file = output_dir / "test_write.tmp"
+        test_file.touch()
+        test_file.unlink()
+        logging.info(f"{Fore.GREEN}✓ Output directory writable{Style.RESET_ALL}")
+    except Exception as e:
+        issues.append(f"Output directory not writable: {e}")
+
+    if issues:
+        logging.error(f"{Fore.RED}Configuration issues found:{Style.RESET_ALL}")
+        for issue in issues:
+            logging.error(f"  - {issue}")
+        sys.exit(1)
+    else:
+        logging.info(f"{Fore.GREEN}Configuration is valid!{Style.RESET_ALL}")
+
+
+if __name__ == "__main__":
+    main()
