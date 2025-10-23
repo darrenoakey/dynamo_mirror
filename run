@@ -18,7 +18,7 @@ from colorama import Fore, Style
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from dynamo_mirror import mirror_dynamodb_tables, TableMapping  # noqa: E402
+from dynamo_mirror import mirror_dynamodb_tables, TableMapping, discover_and_map_stage_tables, APICallQueue, DynamoDBClient  # noqa: E402
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -86,6 +86,9 @@ def create_default_table_mappings(stage_prefix: str) -> List[TableMapping]:
         ("onboarding", "onboarding"),
         ("OnboardingDocument", "onboarding_document"),
         ("OnboardingReferenceData", "onboarding_reference_data"),
+        ("AccountTable", "account"),
+        ("NudgeTable", "nudge"), 
+        ("UserPreferencesTable", "user_preferences")
     ]
 
     mappings = []
@@ -123,19 +126,23 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                          # Mirror default bosphorus tables
+  %(prog)s                          # Auto-discover all stage tables (recommended)
   %(prog)s --db-path ./data/mirror.db
   %(prog)s --region us-west-2 --verbose
   %(prog)s --poll-interval 30       # More responsive (check every 30 seconds)
   %(prog)s --poll-interval 5        # High responsiveness (check every 5 seconds)
   %(prog)s --tables table1 table2 --no-mapping
+  %(prog)s --no-electro             # Disable entity-based view creation
 
-Table Mappings:
-  Default mappings use stage prefix from ~/work/bosphorus-middleware/.sst/stage:
-    {stage}-bosphorus-LendingTable           -> lending
-    {stage}-bosphorus-onboarding             -> onboarding
-    {stage}-bosphorus-OnboardingDocument     -> onboarding_document
-    {stage}-bosphorus-OnboardingReferenceData -> onboarding_reference_data
+Table Discovery:
+  When no --tables specified, automatically discovers all tables matching:
+    {stage}-bosphorus-* -> converted to snake_case
+    {stage}-* -> converted to snake_case
+
+  Examples with stage 'daz3':
+    daz3-bosphorus-LendingTable     -> lending_table
+    daz3-bosphorus-platformConfig   -> platform_config
+    daz3-bosphorus-onboarding       -> onboarding
         """
     )
 
@@ -183,6 +190,19 @@ Table Mappings:
     )
 
     parser.add_argument(
+        "--electro",
+        action="store_true",
+        default=True,
+        help="Create views based on __edb_e__ entity types (default: enabled)"
+    )
+
+    parser.add_argument(
+        "--no-electro",
+        action="store_true",
+        help="Disable electro entity view creation"
+    )
+
+    parser.add_argument(
         "command",
         nargs="?",
         choices=["mirror", "test", "validate"],
@@ -194,6 +214,9 @@ Table Mappings:
 
     # Setup logging first
     setup_logging(args.verbose)
+
+    # Handle electro flag logic
+    enable_electro = args.electro and not args.no_electro
 
     if args.command == "test":
         run_tests()
@@ -222,6 +245,8 @@ Table Mappings:
     logging.info(f"Using AWS region: {region}")
 
     # Determine table mappings
+    stage_prefix = read_stage_prefix()  # Always read stage prefix
+
     if args.tables:
         # Use specific tables provided by user
         if args.no_mapping:
@@ -229,7 +254,6 @@ Table Mappings:
             table_mappings = [TableMapping(table, table) for table in args.tables]
         else:
             # Apply default mapping logic (remove stage prefix if present)
-            stage_prefix = read_stage_prefix()
             table_mappings = []
 
             for table in args.tables:
@@ -244,9 +268,16 @@ Table Mappings:
 
                 table_mappings.append(TableMapping(table, sqlite_name))
     else:
-        # Use default bosphorus tables
-        stage_prefix = read_stage_prefix()
-        table_mappings = create_default_table_mappings(stage_prefix)
+        # Auto-discover all stage tables
+        logging.info(f"Auto-discovering tables for stage: {stage_prefix}")
+        api_queue = APICallQueue(region)
+        dynamodb_client = DynamoDBClient(api_queue)
+        table_mappings = discover_and_map_stage_tables(dynamodb_client, stage_prefix)
+
+        if not table_mappings:
+            logging.error(f"No tables found matching stage prefix: {stage_prefix}")
+            logging.error("Tables should be named like: {stage}-bosphorus-TableName or {stage}-TableName")
+            sys.exit(1)
 
     # Display table mappings
     logging.info("Table mappings:")
@@ -261,7 +292,9 @@ Table Mappings:
         # Start mirroring service
         mirror_dynamodb_tables(table_mappings, region, str(db_path),
                                poll_interval=args.poll_interval,
-                               shard_check_interval=args.shard_check_interval)
+                               shard_check_interval=args.shard_check_interval,
+                               enable_electro=enable_electro,
+                               stage_prefix=stage_prefix)
 
     except KeyboardInterrupt:
         logging.info(f"{Fore.YELLOW}Service stopped by user{Style.RESET_ALL}")

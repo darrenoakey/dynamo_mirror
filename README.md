@@ -1,148 +1,147 @@
+![](banner.jpg)
+
 # DynamoDB Mirror
 
-High-performance DynamoDB to SQLite mirroring service with real-time streaming updates.
+A high-performance service that mirrors DynamoDB tables to a local SQLite database with real-time streaming updates.
 
-## Features
+## Purpose
 
-- **SQLite Storage**: Lightweight, serverless database with JSON support
-- **Real-time Streaming**: Processes DynamoDB streams for live updates
-- **Low Resource Usage**: Configurable polling intervals to minimize CPU, network, and memory usage
-- **Connection Pooling**: Optimized AWS SDK usage prevents connection pool exhaustion
-- **Table Mapping**: Maps DynamoDB table names to clean SQLite names
-- **Automatic Indexing**: Creates indexes on primary keys and GSI attributes
-- **Initial Load**: Performs full table scan only when SQLite table is empty
-- **Multi-threading**: Concurrent shard processing with resource-aware throttling
+DynamoDB Mirror provides a lightweight, local copy of your DynamoDB tables stored in SQLite. It automatically discovers tables based on your stage configuration, performs an initial load, and keeps the local database synchronized with real-time changes through DynamoDB Streams.
 
-## Quick Start
+## Installation
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
+```
 
-# Mirror default bosphorus tables (requires AWS credentials, very low resource usage)
+## Prerequisites
+
+- Python 3.8 or higher
+- AWS credentials configured with DynamoDB access
+- Bosphorus middleware stage file at `~/work/bosphorus-middleware/.sst/stage`
+
+## Usage
+
+### Basic Usage
+
+```bash
+# Auto-discover and mirror all tables for your stage
 ./run
 
-# More responsive (check every 30 seconds)
-./run --poll-interval 30
-
-# High responsiveness (check every 5 seconds)
-./run --poll-interval 5
-
-# Mirror specific tables
-./run --tables table1 table2
-
-# Run tests
-./run test
-
-# Validate configuration
-./run validate
-```
-
-## Default Table Mappings
-
-The service automatically maps bosphorus DynamoDB tables to clean SQLite names:
-
-| DynamoDB Table | SQLite Table |
-|----------------|-------------|
-| `daz3-bosphorus-LendingTable` | `lending` |
-| `daz3-bosphorus-onboarding` | `onboarding` |
-| `daz3-bosphorus-OnboardingDocument` | `onboarding_document` |
-| `daz3-bosphorus-OnboardingReferenceData` | `onboarding_reference_data` |
-
-*Stage prefix (`daz3`) is read from `~/work/bosphorus-middleware/.sst/stage`*
-
-## Configuration
-
-### AWS Credentials
-
-Configure AWS credentials using one of:
-- AWS CLI: `aws configure`
-- Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
-- IAM roles (when running on EC2)
-
-### Database Location
-
-SQLite database is stored at `./output/dynamo_mirror.db` by default. Use `--db-path` to customize:
-
-```bash
-./run --db-path /path/to/database.db
-```
-
-## Architecture
-
-### Data Flow
-
-1. **Table Discovery**: Describes DynamoDB tables for schema information
-2. **SQLite Setup**: Creates tables with JSON columns and expression indexes
-3. **Initial Load**: Scans DynamoDB tables only if SQLite tables are empty
-4. **Stream Processing**: Multi-threaded shard watchers for real-time updates
-
-### Storage Format
-
-Items are stored as JSON in SQLite with indexes on key attributes:
-
-```sql
-CREATE TABLE lending (
-    item_data TEXT NOT NULL
-);
-
-CREATE INDEX lending_id_idx ON lending (json_extract(item_data, '$.id'));
-```
-
-### Threading Model & Resource Usage
-
-- Main thread manages initialization and coordination
-- Stream manager thread per table monitors for new shards
-- Shard watcher thread per shard processes records
-
-**Default Performance (Very Low Resource Usage):**
-- Stream polling: Every 60 seconds
-- Shard discovery: Every 10 minutes
-- Updates appear within 60 seconds
-- Minimal CPU, network, and memory impact
-
-## Advanced Usage
-
-### Custom Table Selection
-
-```bash
-# Mirror specific tables with original names
-./run --tables MyTable1 MyTable2 --no-mapping
-
-# Mirror with custom region
-./run --region us-west-2
-```
-
-### Monitoring
-
-Enable verbose logging to see detailed operations:
-
-```bash
+# Mirror with debug logging
 ./run --verbose
 ```
 
-### Testing
-
-Run comprehensive test suite:
+### Configuration Options
 
 ```bash
+# Custom database location
+./run --db-path /path/to/database.db
+
+# Specify AWS region
+./run --region us-west-2
+
+# Adjust polling interval (higher = less resource usage)
+./run --poll-interval 60   # Default: very low resource usage
+./run --poll-interval 30   # Medium responsiveness
+./run --poll-interval 5    # High responsiveness
+
+# Mirror specific tables
+./run --tables MyTable1 MyTable2
+
+# Use original DynamoDB table names (no mapping)
+./run --tables MyTable --no-mapping
+
+# Disable entity-based views
+./run --no-electro
+```
+
+### Validation and Testing
+
+```bash
+# Validate configuration and AWS credentials
+./run validate
+
+# Run test suite
 ./run test
 ```
 
-Tests use real SQLite databases (no mocking) to ensure accurate validation.
+## Examples
 
-## Requirements
+### Auto-Discovery (Recommended)
 
-- Python 3.8+
-- AWS credentials with DynamoDB access
-- Dependencies: `boto3`, `colorama`
+```bash
+# Discovers all tables matching {stage}-bosphorus-* or {stage}-*
+./run
+```
 
-## Development
+If your stage is `daz3`, this automatically discovers and mirrors:
+- `daz3-bosphorus-LendingTable` → `lending_table`
+- `daz3-bosphorus-onboarding` → `onboarding`
+- `daz3-bosphorus-platformConfig` → `platform_config`
 
-Project follows strict Python standards:
+### Specific Tables
 
-- All code in `src/` directory
-- Every `.py` file has corresponding `_test.py`
-- Real database testing (no mocks)
-- Comprehensive logging with colored output
-- Type hints throughout
+```bash
+# Mirror only lending and onboarding tables
+./run --tables daz3-bosphorus-LendingTable daz3-bosphorus-onboarding
+
+# Keep original table names
+./run --tables MyProductionTable --no-mapping
+```
+
+### Different Environments
+
+```bash
+# Production with high responsiveness
+./run --region us-east-1 --poll-interval 5
+
+# Development with minimal resource usage
+./run --poll-interval 120 --verbose
+```
+
+## Accessing Your Data
+
+The mirrored data is stored in SQLite at `./output/dynamo_mirror.db` by default. Items are stored as JSON:
+
+```bash
+# Query with sqlite3
+sqlite3 ./output/dynamo_mirror.db "SELECT json_extract(item_data, '$.id') FROM lending LIMIT 10"
+
+# Or use any SQLite client
+```
+
+## Troubleshooting
+
+### AWS Credentials
+
+If you see credential errors:
+
+```bash
+# For AWS SSO users
+aws sso login
+
+# Then retry
+./run validate
+```
+
+### Stage Configuration
+
+Ensure your stage file exists:
+
+```bash
+cat ~/work/bosphorus-middleware/.sst/stage
+```
+
+### No Tables Found
+
+If auto-discovery finds no tables:
+
+```bash
+# Check your AWS region
+./run --region us-east-1 --verbose
+
+# Or explicitly specify tables
+./run --tables your-table-name
+```
